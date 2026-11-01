@@ -57,22 +57,216 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [4, 7, 11]  ### YOUR CODE HERE
+
+from typing import Literal  # noqa: E402
+
+from pydantic import BaseModel, Field  # noqa: E402
+
+# Every chosen point is a "scuttlebutt" point: the evidence is what outsiders
+# and staff say in interviews. For each point we route to its topic and to the
+# two roles that know about it (README, "Who knows about it"), and say in plain
+# words what favourable and unfavourable evidence looks like.
+POINT_PLANS: dict[int, dict[str, Any]] = {
+    4: {
+        "name": "Above-average sales organization",
+        "topic": "sales_team",
+        "roles": ["customer", "competitor"],
+        "favourable": "the sales force is skilled, proactive and consultative: reps know the "
+                      "customer's products, visit, solve problems, are better trained than rivals' "
+                      "or win head-to-head deals",
+        "unfavourable": "the sales force is passive, weak or unknowledgeable: reps only send price "
+                        "lists, keep changing, do not know the product, are not a factor in deals "
+                        "or lose customers to rivals",
+    },
+    7: {
+        "name": "Outstanding labour and personnel relations",
+        "topic": "working_conditions",
+        "roles": ["current_employee", "former_employee"],
+        "favourable": "staff are treated well: fair pay, good training, low turnover, people stay "
+                      "for years, problems get fixed (a former employee who left for a personal "
+                      "reason such as moving city but praises the company is favourable)",
+        "unfavourable": "relations are poor: high turnover, constant overtime, people quitting, low "
+                        "morale, strikes or strike threats, complaints about pay",
+    },
+    11: {
+        "name": "Advantage over competitors",
+        "topic": "competitive_edge",
+        "roles": ["competitor", "customer"],
+        "favourable": "the company has a durable edge that rivals cannot easily match: high "
+                      "switching costs, know-how or installed base that is hard to copy, "
+                      "unmatched performance, customers who leave come back",
+        "unfavourable": "the company has no real edge: its products are a commodity, "
+                        "interchangeable with other suppliers, easy to copy, or bought purely on price",
+    },
+}
+
+# If nobody who knows gives a usable answer, fall back to the more common verdict.
+DEFAULT_VERDICT = "PASS"
+MAX_PARALLEL_COMPANIES = 8
+MAX_ATTEMPTS = 3
+
+
+class WitnessStance(BaseModel):
+    """How one interview answer bears on a Fisher point."""
+
+    stance: Literal["favourable", "unfavourable", "no_comment"] = Field(
+        description="favourable or unfavourable for the company on this point; no_comment if the "
+                    "person says they cannot comment or the answer says nothing about the point"
+    )
+    reason: str = Field(description="One short sentence citing the words that decided the stance.")
+
+
+class ReflectedVerdict(BaseModel):
+    """A final verdict after re-reading conflicting or unclear evidence."""
+
+    verdict: Literal["PASS", "FAIL"]
+    reason: str = Field(description="One short sentence explaining the verdict.")
+
+
+STANCE_PROMPT = """You are an equity analyst applying Philip Fisher's "scuttlebutt" method.
+Fisher's point {point}: {question}
+
+Evidence counts as FAVOURABLE when {favourable}.
+Evidence counts as UNFAVOURABLE when {unfavourable}.
+If the person says they cannot comment, or says nothing relevant, the stance is no_comment.
+
+A {role} was asked about the company's {topic}. Their answer:
+{answer}
+
+Classify this single answer."""
+
+REFLECT_PROMPT = """You are checking an analyst's work on Philip Fisher's point {point}: {question}
+
+PASS means the company looks favourable on this point. It is favourable when {favourable}.
+It is unfavourable when {unfavourable}.
+
+The interview evidence and the first reading of each answer:
+{evidence}
+
+The readings conflict or are unclear. Re-read the quoted answers themselves (not the readings),
+weigh them, and give the final PASS or FAIL verdict."""
+
+SUMMARY_PROMPT = """Write a short summary (2 to 3 sentences, plain prose, no lists) of this Fisher
+analysis of {company}. Explain each verdict with the interview evidence behind it; quote a few
+words where it helps. Do not invent facts.
+
+{findings}"""
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """Create the DeepSeek model and the three prompt chains used for every company.
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
-
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
+    The tools differ per company, so the routing and the interviews happen in
+    ``analyze_companies``. Here we build what is shared: a structured
+    classifier for single interview answers, a reflection step for points
+    whose evidence conflicts, and a summary writer.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    # Thinking mode rejects the forced tool call that structured output uses,
+    # and these one-answer classifications do not need it.
+    model = ChatDeepSeek(
+        model=MODEL_NAME, temperature=0, max_retries=3, timeout=120,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    return {
+        "stance": ChatPromptTemplate.from_template(STANCE_PROMPT)
+        | model.with_structured_output(WitnessStance),
+        "reflect": ChatPromptTemplate.from_template(REFLECT_PROMPT)
+        | model.with_structured_output(ReflectedVerdict),
+        "summary": ChatPromptTemplate.from_template(SUMMARY_PROMPT) | model,
+    }
+
+
+async def _with_retries(coro_factory: Any) -> Any:
+    """Await ``coro_factory()``, retrying with a short backoff on any error."""
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            return await coro_factory()
+        except Exception:
+            if attempt == MAX_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(2 * (attempt + 1))
+
+
+def _point_inputs(point: int) -> dict[str, str]:
+    plan = POINT_PLANS[point]
+    return {
+        "point": str(point),
+        "question": FISHER_POINTS[point],
+        "favourable": plan["favourable"],
+        "unfavourable": plan["unfavourable"],
+    }
+
+
+async def _judge_point(agent: dict[str, Any], interview: Any, point: int) -> dict[str, Any]:
+    """Interview the people who know, classify each answer, and reflect if they disagree."""
+    plan = POINT_PLANS[point]
+    topic = plan["topic"]
+    answers = await asyncio.gather(*(
+        asyncio.to_thread(interview.invoke, {"role": role, "topic": topic}) for role in plan["roles"]
+    ))
+    stances = await asyncio.gather(*(
+        _with_retries(lambda role=role, answer=answer: agent["stance"].ainvoke(
+            {**_point_inputs(point), "role": role.replace("_", " "), "topic": topic.replace("_", " "),
+             "answer": answer}
+        ))
+        for role, answer in zip(plan["roles"], answers)
+    ))
+    witnesses = [
+        {"role": role, "answer": answer, "stance": s.stance, "reason": s.reason}
+        for role, answer, s in zip(plan["roles"], answers, stances)
+    ]
+
+    # Agreement check in code: the people who know should agree (README), so a
+    # unanimous reading is final; a conflict or no usable answer gets reflection.
+    votes = {w["stance"] for w in witnesses} - {"no_comment"}
+    if votes == {"favourable"}:
+        verdict, how = "PASS", "unanimous"
+    elif votes == {"unfavourable"}:
+        verdict, how = "FAIL", "unanimous"
+    elif votes:
+        evidence = "\n".join(
+            f"- {w['role']}: {w['answer']}\n  first reading: {w['stance']} ({w['reason']})" for w in witnesses
+        )
+        reflected = await _with_retries(
+            lambda: agent["reflect"].ainvoke({**_point_inputs(point), "evidence": evidence})
+        )
+        verdict, how = reflected.verdict, f"reflection: {reflected.reason}"
+    else:
+        verdict, how = DEFAULT_VERDICT, "no usable interview answer; default"
+    return {"point": point, "verdict": verdict, "how": how, "witnesses": witnesses}
+
+
+def _fallback_summary(findings: list[dict[str, Any]]) -> str:
+    return " ".join(
+        f"Point {f['point']} ({POINT_PLANS[f['point']]['name']}): {f['verdict']}, "
+        + "; ".join(w["reason"] for w in f["witnesses"] if w["stance"] != "no_comment") + "."
+        for f in findings
+    )
+
+
+async def _analyze_company(agent: dict[str, Any], name: str, tools: list[Any]) -> dict[str, Any]:
+    interview = next(t for t in tools if t.name == "interview")
+    # The three points use different topics, so they run in parallel.
+    findings = await asyncio.gather(*(_judge_point(agent, interview, p) for p in CHOSEN_POINTS))
+    points = {f["point"]: f["verdict"] for f in findings}
+
+    findings_text = "\n".join(
+        f"Point {f['point']} ({POINT_PLANS[f['point']]['name']}): {f['verdict']}\n"
+        + "\n".join(f"  - {w['role']}: {w['answer']}" for w in f["witnesses"])
+        for f in findings
+    )
+    try:
+        message = await _with_retries(lambda: agent["summary"].ainvoke(
+            {"company": name.replace("_", " ").title(), "findings": findings_text}
+        ))
+        summary = str(message.content).strip() or _fallback_summary(findings)
+    except Exception:
+        summary = _fallback_summary(findings)
+    return {"points": points, "summary": summary}
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +303,20 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_COMPANIES)
+
+    async def guarded(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                return name, await _analyze_company(agent, name, tools)
+            except Exception as exc:  # one failed company must not crash the run
+                return name, {
+                    "points": {p: DEFAULT_VERDICT for p in CHOSEN_POINTS},
+                    "summary": f"Analysis failed ({type(exc).__name__}: {exc}); default verdicts given.",
+                }
+
+    results = await asyncio.gather(*(guarded(name, tools) for name, tools in companies.items()))
+    return dict(results)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

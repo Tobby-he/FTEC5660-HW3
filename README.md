@@ -170,14 +170,79 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+I chose three of Fisher's "scuttlebutt" points: **4, 7 and 11**. Fisher's
+method is to ask the people around a business (customers, competitors,
+suppliers, staff) instead of trusting what management says about itself. These
+three points are where that method fits best, because the evidence is what
+outsiders and staff say, not what the documents claim. They also need no
+numeric threshold that would have to be reverse-engineered: the evidence is
+qualitative, and the people who know a topic always agree, so a verdict holds up
+as long as the right people are asked and their answers are read correctly.
+
+| Point | Why I chose it | PASS rule | Evidence |
+| --- | --- | --- | --- |
+| **4. Above-average sales organization** (*"Does the company have an above-average sales organization?"*) | Fisher argues that good products need a strong sales force behind them. Customers deal with that sales force directly, and competitors meet it in every deal. | **PASS** if the people who deal with the sales force describe it as skilled and consultative: reps know the customer's line, visit and solve problems, are better trained than rivals' or win head-to-head deals. **FAIL** if reps are passive, keep changing, don't know the product or are "not a factor". | `interview(customer, sales_team)` and `interview(competitor, sales_team)` |
+| **7. Outstanding labour and personnel relations** (*"Does the company have outstanding labor and personnel relations?"*) | Turnover and strikes are a hidden cost that management letters rarely admit to ("our people are our greatest strength"). Staff, past and present, are the honest source. | **PASS** if staff describe fair pay, low turnover, people staying for years and problems being fixed. A former employee who left for personal reasons but praises the company counts as favourable. **FAIL** on constant overtime, high turnover, low morale or strike threats. | `interview(current_employee, working_conditions)` and `interview(former_employee, working_conditions)` |
+| **11. Advantage over competitors** (*"…aspects of the business … which will give the investor important clues as to how outstanding the company may be in relation to its competition?"*) | Fisher's point is about what makes a company hard to compete with. Rivals and customers are the ones who feel it. | **PASS** if there is a durable edge: high switching costs, know-how or an installed base that is hard to copy, unmatched performance, customers who leave and come back. **FAIL** if the product is a commodity, interchangeable with other suppliers, easy to copy or bought on price alone. | `interview(competitor, competitive_edge)` and `interview(customer, competitive_edge)` |
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A["analyze_companies<br/>20 companies, up to 8 in parallel"] --> B["Planner / router (code)<br/>point → topic → the 2 roles who know"]
+    B --> P4["Point 4: sales_team"]
+    B --> P7["Point 7: working_conditions"]
+    B --> P11["Point 11: competitive_edge"]
+    P4 --> I4["interview tool × 2<br/>customer, competitor"]
+    P7 --> I7["interview tool × 2<br/>current & former employee"]
+    P11 --> I11["interview tool × 2<br/>competitor, customer"]
+    I4 & I7 & I11 --> S["Stance classifier (LLM, structured output)<br/>one call per answer:<br/>favourable / unfavourable / no_comment"]
+    S --> C{"Agreement check (code)"}
+    C -- "unanimous" --> V["Verdict PASS / FAIL"]
+    C -- "conflict" --> R["Reflection (LLM)<br/>re-read both quotes → final verdict"]
+    C -- "no usable answer" --> D["Default PASS"]
+    R --> V
+    D --> V
+    V --> W["Summary writer (LLM)<br/>2–3 sentences quoting the evidence"]
+    W --> O["{points, summary}"]
+```
+
+The agent is a code-controlled workflow built from LangChain chains on
+`deepseek-v4-flash` (temperature 0, thinking turned off). It does not use a
+free-roaming ReAct loop, because the interview budget and the
+"only some people know" rule make planning matter. **Routing and planning**
+happen in code: each point maps to its interview topic and to the two roles
+that know about it, so every company uses exactly 6 of its 10 interviews and
+never wastes one on someone who can't comment. **Parallel calls**: the three
+points, and the two interviews per point, run concurrently, and up to 8
+companies run at once (a full public run takes about 30 s). **Prompt chaining
+with structured output**: each interview answer goes to a classifier prompt
+that holds Fisher's question plus my own description of favourable and
+unfavourable evidence, and it returns a Pydantic `WitnessStance`. The model
+judges one quote at a time and does no arithmetic or aggregation. **Reflection**:
+the votes are combined in code. If the two witnesses agree, that is the
+verdict. If they conflict, a second LLM call re-reads the original quotes, not
+the first readings, and decides. If nobody gives a usable answer, the verdict
+falls back to PASS, the more common case. A final chain writes the summary from
+the verdicts and the quotes. Every LLM call is retried, and each company is
+wrapped in `try/except`, so one failed API call cannot crash the run.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+On `public_test` the agent scores **60/60 point verdicts, balanced accuracy
+100.0%**, in each of three consecutive runs. There are **no disagreements**
+with `ground_truth.json`. For every company and point, both knowledgeable
+witnesses gave answers whose direction matched the answer key, so the
+reflection step never fired on the public data. I also checked it on
+paraphrased and adversarial answers I wrote myself (one witness with "no
+comment", a former employee who left for family reasons but praises the
+employer, a patents-versus-easy-switching conflict). The classifier and the
+reflection step handled them as intended.
+
+Remaining risk on the private set: the wording there is different, so a quote
+that is truly ambiguous could be misread. Asking two independent witnesses and
+reflecting when they disagree is the guard against that.
