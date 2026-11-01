@@ -246,7 +246,3 @@ reflection step handled them as intended.
 Remaining risk on the private set: the wording there is different, so a quote
 that is truly ambiguous could be misread. Asking two independent witnesses and
 reflecting when they disagree is the guard against that.
-
-## Task 2: Reflection
-
-See [REFLECTION.md](REFLECTION.md).
